@@ -1,0 +1,13 @@
+{
+  "name": "tanglaw",
+  "version": "0.2.0",
+  "private": true,
+  "scripts": {
+    "dev": "node server.js",
+    "tunnel": "npx --yes cloudflared tunnel --url http://localhost:3000"
+  },
+  "dependencies": {
+    "@rnmapbox/maps": "^10.3.18",
+    "react-native-map-link": "^3.15.0"
+  }
+}
