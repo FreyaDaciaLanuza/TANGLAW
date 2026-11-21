@@ -587,7 +587,7 @@ const V = {
             <span>${r.pname ? esc(r.pname) + ' · ' : ''}${esc(r.date)}, ${rng(r)}<br>${esc(r.by || '')}${r.purpose ? ' · ' + esc(r.purpose) : ''}</span><br>
             ${btn('rs', r.id, 'Approved', 'Approve')}${btn('rs', r.id, 'Rejected', 'Reject')}
           </div>
-        </div>`).join('') || '<p class="note">No pending requests for your parks.</p>') +
+        </div>`).join('') || `<p class="note">No pending requests for your parks.${!mine().length ? ' This account has no parks yet. Add one on the Map tab. Parks added under a different account are not shown here.' : ''}</p>`) +
       `<h2>Approved reservations</h2>` +
       (ap.map(r => `<div class="row">
           <div>
@@ -2178,7 +2178,10 @@ document.addEventListener('submit', async e => {
         catch { return toast('Invalid access code for that role, or the server is unreachable.'); }
       }
 
-      st.user = { id: uid(), name: d.name.trim(), email: em, pass: d.pass, role: rl, code: rl == 'citizen' ? '' : d.code };
+      // Staff IDs come from role + email, so the same staff account gets the same ID on every device or tunnel link.
+      // (Random IDs made a park manager lose their parks, and their pending requests, whenever the account was recreated.)
+      const sid = (rl + ':' + em.toLowerCase()).split('').reduce((h, c) => (Math.imul(h, 31) + c.charCodeAt(0)) >>> 0, 7).toString(36);
+      st.user = { id: rl == 'citizen' ? uid() : 'm' + sid, name: d.name.trim(), email: em, pass: d.pass, role: rl, code: rl == 'citizen' ? '' : d.code };
       st.duty = false;
       st.dutySince = null;
     } else if (!st.user || st.user.email != em || st.user.pass != d.pass) {
