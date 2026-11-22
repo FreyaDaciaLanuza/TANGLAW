@@ -24,7 +24,7 @@ const CODES = {
 
 const roleOf = c => c ? ['admin', 'manager', 'responder'].find(r => CODES[r] === c) || null : null;
 
-let db = { incidents: [], responders: {}, reservations: [], hazards: [], users: {}, contacts: [], parks: [], chat: [], timelogs: [] };
+let db = { incidents: [], responders: {}, reservations: [], hazards: [], users: {}, contacts: [], parks: [], chat: [], timelogs: [], services: [], traffic: {} };
 try { db = { ...db, ...JSON.parse(fs.readFileSync(DB)) }; } catch {}
 
 const save = () => fs.writeFile(DB, JSON.stringify(db), () => {});
@@ -45,10 +45,18 @@ const send = (res, c, o) => {
   res.end(JSON.stringify(o));
 };
 
+// Ids sent by the browser may only contain letters, digits, _ and -, so they are safe to store and to show in pages.
+const IDK = new Set(['id', 'uid', 'mid', 'rid', 'pid', 'to']);
+const clean = (o, k) =>
+  Array.isArray(o) ? o.map(x => clean(x, k))
+  : o && typeof o == 'object' ? Object.fromEntries(Object.entries(o).map(([k2, v]) => [k2, clean(v, k2)]))
+  : typeof o == 'string' && IDK.has(k) ? o.replace(/[^\w-]/g, '')
+  : o;
+
 const body = req => new Promise(r => {
   let s = '';
   req.on('data', c => { s += c; if (s.length > 6e5) req.destroy(); });
-  req.on('end', () => { try { r(JSON.parse(s || '{}')); } catch { r({}); } });
+  req.on('end', () => { try { r(clean(JSON.parse(s || '{}'))); } catch { r({}); } });
 });
 
 // Nearest available responder: on duty, location fresh (<2 min), not already assigned to an active incident.
@@ -72,6 +80,7 @@ const FAC = ['Basketball court', 'Covered pavilion', 'Playground', 'Open lawn'],
       tmin = t => +t.slice(0, 2) * 60 + +t.slice(3);
 
 const FILES = {
+  'lang.js': 'application/javascript',
   'index.html': 'text/html',
   'app.js':     'text/javascript',
   'styles.css': 'text/css'
@@ -118,6 +127,28 @@ function sweep() {
   if (ch) save();
 }
 setInterval(sweep, 30000);
+
+// ----- Foot traffic: distinct app users inside a park's area, per hour. Only counts are saved. -----
+const SKINDS = ['Police station', 'Hospital', 'Barangay hall', 'Well-lit area'],
+      seenV = {};
+function countVisit(id, lat, lng) {
+  const d = new Date(), t = ymd(d), h = d.getHours();
+  for (const pk of db.parks) {
+    if (km(pk.lat, pk.lng, lat, lng) * 1000 > pk.r) continue;
+    const k = pk.id + '|' + t + '|' + h;
+    if (!seenV[k]) {
+      if (Object.keys(seenV).length > 4000) for (const x in seenV) delete seenV[x];
+      seenV[k] = new Set();
+    }
+    if (seenV[k].has(id)) continue;
+    seenV[k].add(id);
+    const days = (db.traffic[pk.id] = db.traffic[pk.id] || {});
+    days[t] = days[t] || {};
+    days[t][h] = (days[t][h] || 0) + 1;
+    for (const x of Object.keys(days).sort().slice(0, -45)) delete days[x];   // keep about six weeks
+    save();
+  }
+}
 
 http.createServer(async (req, res) => {
   const U = new URL(req.url, 'http://x'),
@@ -200,6 +231,7 @@ http.createServer(async (req, res) => {
         lng:  +b.lng,
         ts:   Date.now()
       };
+      if (!role) countVisit(S(b.id, 20), +b.lat, +b.lng);
       return send(res, 200, { ok: 1 });
     }
 
@@ -261,10 +293,27 @@ http.createServer(async (req, res) => {
         if (!b.id || !S(b.name, 60).trim()) return send(res, 400, {});
         const uid = S(b.id, 20), nm = S(b.name, 60).trim();
         if (!db.users[uid] || db.users[uid].name != nm) {
-          db.users[uid] = { name: nm };
+          db.users[uid] = { ...(db.users[uid] || {}), name: nm };
           save();
         }
+        return send(res, 200, { ok: 1, suspended: !!db.users[uid].suspended });
+      }
+      if (a[1] && m == 'PATCH') {
+        if (!is('admin')) return send(res, 403, {});
+        const b = await body(req);
+        if (!db.users[a[1]]) return send(res, 404, {});
+        if (b.suspended) db.users[a[1]].suspended = true;
+        else delete db.users[a[1]].suspended;
+        save();
         return send(res, 200, { ok: 1 });
+      }
+      if (m == 'GET' && is('admin') && q('all')) {
+        const n = Date.now();
+        return send(res, 200,
+          Object.entries(db.users)
+            .map(([id, x]) => ({ id, name: x.name, suspended: !!x.suspended, online: !!(pres[id] && n - pres[id].ts < 9e4) }))
+            .sort((x, y) => x.name.localeCompare(y.name))
+        );
       }
       if (m == 'GET') {
         const s = q('q').trim().toLowerCase(), me = q('me');
@@ -374,11 +423,11 @@ http.createServer(async (req, res) => {
       }
 
       if (a[1] && m == 'PATCH') {
-        if (!is('manager')) return send(res, 403, {});
+        if (!is('manager', 'admin')) return send(res, 403, {});
         const x = db.parks.find(k => k.id == a[1]);
         if (!x) return send(res, 404, {});
         const b = await body(req);
-        if (x.mid != b.mid) return send(res, 403, {});
+        if (role == 'manager' && x.mid != b.mid) return send(res, 403, {});
         if (b.closed) { x.closed = Date.now(); x.closedReason = S(b.reason, 80); }
         else { delete x.closed; delete x.closedReason; }
         save();
@@ -473,13 +522,41 @@ http.createServer(async (req, res) => {
       }
     }
 
-    // ----- Incidents: citizens create; responders manage; admin read-only -----
+    // ----- Safety places (police, hospitals, barangay halls, well-lit areas): everyone reads, admin edits -----
+    if (a[0] == 'services') {
+      if (!a[1] && m == 'GET') return send(res, 200, db.services);
+      if (!is('admin')) return send(res, 403, {});
+      if (!a[1] && m == 'POST') {
+        const b = await body(req);
+        if (!SKINDS.includes(b.kind) || !isFinite(b.lat) || !isFinite(b.lng) || !S(b.name, 60).trim())
+          return send(res, 400, {});
+        db.services.push({ id: S(b.id || Date.now().toString(36), 20), kind: b.kind, name: S(b.name, 60).trim(), lat: +b.lat, lng: +b.lng });
+        save();
+        return send(res, 200, { ok: 1 });
+      }
+      if (a[1] && m == 'DELETE') {
+        db.services = db.services.filter(x => x.id != a[1]);
+        save();
+        return send(res, 200, { ok: 1 });
+      }
+    }
+
+    // ----- Foot traffic: hourly visitor counts per park (managers see their own parks, admin sees all) -----
+    if (a[0] == 'traffic' && m == 'GET') {
+      if (!is('manager', 'admin')) return send(res, 403, {});
+      const out = {};
+      for (const pk of db.parks)
+        if (role == 'admin' || pk.mid == q('mid')) out[pk.id] = db.traffic[pk.id] || {};
+      return send(res, 200, out);
+    }
+
+    // ----- Incidents: citizens create; responders manage; admin can also resolve or delete -----
     if (a[0] == 'incidents') {
       if (!a[1] && m == 'GET') {
         if (!is('responder', 'admin')) return send(res, 403, {});
         return send(res, 200,
           db.incidents
-            .filter(i => i.status < 3)
+            .filter(i => i.status < 3 || (is('admin') && q('all')))
             .map(i => ({ ...i, nearest: i.status ? null : nearest(i) }))
         );
       }
@@ -509,6 +586,19 @@ http.createServer(async (req, res) => {
 
       if (m == 'GET')
         return send(res, 200, { status: i.status, responder: i.responder });
+
+      if (m == 'DELETE') {
+        if (!is('admin')) return send(res, 403, {});
+        db.incidents = db.incidents.filter(x => x.id != i.id);
+        save();
+        return send(res, 200, { ok: 1 });
+      }
+
+      if (m == 'PATCH' && is('admin')) {
+        const b = await body(req);
+        if (+b.status == 3 && i.status < 3) { i.status = 3; save(); }
+        return send(res, 200, { status: i.status });
+      }
 
       if (m == 'PATCH') {
         if (!is('responder')) return send(res, 403, {});
@@ -546,6 +636,7 @@ http.createServer(async (req, res) => {
 
       if (!a[1] && m == 'POST') {
         const b = await body(req);
+        if (db.users[S(b.uid, 20)]?.suspended) return send(res, 403, { error: 'suspended' });
         if (!FAC.includes(b.fac) ||
             !/^\d{4}-\d\d-\d\d$/.test(b.date) ||
             !TM.test(b.start) || !TM.test(b.end) ||
@@ -599,11 +690,11 @@ http.createServer(async (req, res) => {
           if (!live(r) || !upcoming(r)) return send(res, 409, {});
           const note = S(b.note, 200).trim();
 
-          if (is('manager')) {
-            if (pk && pk.mid != b.mid) return send(res, 403, {});
+          if (is('manager', 'admin')) {
+            if (role == 'manager' && pk && pk.mid != b.mid) return send(res, 403, {});
             if (r.status != 'Approved') return send(res, 409, {});
             if (!MREASONS.includes(b.reason) || (b.reason == 'Other' && !note)) return send(res, 400, {});
-            r.cancelBy = 'manager';
+            r.cancelBy = role == 'admin' ? 'admin' : 'manager';
             r.cancelReason = b.reason == 'Other' ? note : b.reason;
             r.cancelNote = b.reason == 'Other' ? '' : note;
           } else if (!role && b.uid && b.uid == r.uid) {
@@ -618,11 +709,11 @@ http.createServer(async (req, res) => {
           return send(res, 200, { ok: 1 });
         }
 
-        if (!is('manager')) return send(res, 403, {});
+        if (!is('manager', 'admin')) return send(res, 403, {});
         if (!['Approved', 'Rejected'].includes(b.status)) return send(res, 400, {});
         if (r.status == 'Cancelled') return send(res, 409, {});
-        // Only the manager of the park decides (older requests with no park can be handled by any manager).
-        if (pk && pk.mid != b.mid) return send(res, 403, {});
+        // Only the manager of the park decides (older requests with no park can be handled by any manager). Admin can decide any.
+        if (role == 'manager' && pk && pk.mid != b.mid) return send(res, 403, {});
         r.status = b.status;
         save();
         return send(res, 200, { ok: 1 });
@@ -644,12 +735,13 @@ http.createServer(async (req, res) => {
             id: h.id, uid: h.uid, cat: h.cat, desc: h.desc,
             lat: h.lat, lng: h.lng, status: h.status,
             created: h.created, photo: !!h.photo,
-            by: is('responder', 'admin') ? h.by : undefined
+            by: is('responder', 'manager', 'admin') ? h.by : undefined
           }))
         );
 
       if (!a[1] && m == 'POST') {
         const b = await body(req);
+        if (db.users[S(b.uid, 20)]?.suspended) return send(res, 403, { error: 'suspended' });
         if (!b.id || !isFinite(b.lat) || !isFinite(b.lng) || !b.desc)
           return send(res, 400, {});
         const ph = typeof b.photo == 'string' &&
@@ -677,12 +769,19 @@ http.createServer(async (req, res) => {
       if (!h) return send(res, 404, {});
 
       if (m == 'PATCH') {
-        if (!is('responder')) return send(res, 403, {});
+        if (!is('responder', 'manager', 'admin')) return send(res, 403, {});
         const b = await body(req);
         const ok = (h.status == 'Pending' && ['Approved', 'Rejected'].includes(b.status)) ||
                    (h.status == 'Approved' && b.status == 'Fixed');
         if (!ok) return send(res, 409, {});
         h.status = b.status;
+        save();
+        return send(res, 200, { ok: 1 });
+      }
+
+      if (m == 'DELETE') {
+        if (!is('admin')) return send(res, 403, {});
+        db.hazards = db.hazards.filter(x => x.id != h.id);
         save();
         return send(res, 200, { ok: 1 });
       }

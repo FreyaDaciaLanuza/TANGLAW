@@ -449,3 +449,14 @@ summary { cursor: pointer; color: var(--mut); font-size: 14px; }
 #ov .sheet form textarea, #ov .sheet form select { text-align: left; }
 #ov .sheet form textarea { resize: vertical; }
 #ov .sheet form label { text-align: left; }
+
+/* Admin console and foot traffic */
+a.card:active { background: #fff1e8; }
+.tbars {
+  display: flex; align-items: flex-end; gap: 2px;
+  height: 44px; margin: 8px 0 2px;
+}
+.tbars i {
+  flex: 1; min-height: 2px; border-radius: 2px;
+  background: var(--lamp);
+}

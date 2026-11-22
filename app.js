@@ -39,7 +39,7 @@ const uid = () => Math.random().toString(36).slice(2, 8);
 
 /* Timing / limits (demo mode uses shorter windows) */
 const GRACE   = 60;
-const LIM     = () => st.demo ? 10  : 180;
+const LIM     = () => st.demo ? 10  : (st.lim || 5) * 60;   // seconds; the user can pick 3, 5 or 10 minutes in Settings
 const TTL     = () => st.demo ? 60  : 900;
 
 const LV = ['Low', 'Medium', 'High'];
@@ -74,7 +74,7 @@ const MREASONS = ['Maintenance or repair', 'Bad weather', 'Safety concern', 'Dou
 const nowHM = () => { const d = new Date(); return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0'); };
 const upc = r => r.date > today() || (r.date == today() && r.end > nowHM());
 const cxInfo = r => r.status != 'Cancelled' ? '' :
-  `<br>Cancelled ${r.cancelBy == 'auto' ? 'automatically' : r.cancelBy == 'manager' ? 'by the park manager' : 'by you'}` +
+  `<br>Cancelled ${r.cancelBy == 'auto' ? 'automatically' : r.cancelBy == 'manager' ? 'by the park manager' : r.cancelBy == 'admin' ? 'by an administrator' : 'by you'}` +
   (r.cancelReason ? ': ' + esc(r.cancelReason) : '') + (r.cancelNote ? ' (' + esc(r.cancelNote) + ')' : '');
 
 const today = () =>
@@ -136,6 +136,7 @@ const ROLES = {
     home: 'admin',
     nav: [
       ['admin',    'Map'],
+      ['console',  'Manage'],
       ['chat',     'Chat'],
       ['settings', 'Settings']
     ]
@@ -147,7 +148,7 @@ const ROUTES = {
   citizen:   ['home', 'sos', 'incident', 'reserve', 'reserved', 'requests', 'report', 'contacts', 'link', 'settings'],
   responder: ['hub', 'chat', 'settings'],
   manager:   ['pmap', 'manage', 'chat', 'schedule', 'report', 'settings'],
-  admin:     ['admin', 'chat', 'settings']
+  admin:     ['admin', 'console', 'a-users', 'a-inc', 'a-res', 'a-hz', 'a-places', 'chat', 'settings']
 };
 
 const LABEL = {
@@ -338,6 +339,7 @@ function simAround(la, lo) {
   return out;
 }
 
+let SV  = [];                  // safety places: police, hospitals, barangay halls, well-lit areas
 let HZ  = [];                  // raw hazards
 let HZA = [];                  // hazards flattened for scoring
 let SIG = { crowd: [], incidents: [], resp: [] };
@@ -377,7 +379,7 @@ function risk(la, lo, h, cs, rs) {
     if (d < 150) nh++;
     if (!f) continue;
     const lightPenalty = s.cat == 'Broken streetlight' ? .3 + .7 * dk : 1 + .5 * dk;
-    hz += (HW[s.cat] ?? .15) * f * lightPenalty;
+    hz += (HW[s.cat] ?? .15) * f * lightPenalty * (s.status == 'Pending' ? .5 : 1);   // reported hazards count at once; half weight until verified
   }
 
   /* Crowd density: more people nearby = safer */
@@ -396,6 +398,19 @@ function risk(la, lo, h, cs, rs) {
     rp += .3 * bump(d / w, 300);
   }
   rp = Math.min(.3, rp);
+
+  /* Emergency services (police, hospital, barangay hall) within ~500 m add safety.
+     Well-lit areas remove the small after-dark penalty that every other place carries. */
+  let es = 0, lit = 0, ns = null;
+  for (const s of SV) {
+    const d = dist(s.lat, s.lng);
+    if (s.kind == 'Well-lit area') { lit += bump(d / w, 150); continue; }
+    es += .2 * bump(d / w, 500);
+    if (!ns || d < ns.d) ns = { d, name: s.name, kind: s.kind };
+  }
+  es = Math.min(.2, es);
+  lit = Math.min(1, lit);
+  const ld = .12 * dk * (1 - lit);
 
   /* Recent incidents: linear decay over 6 hours */
   const t = Date.now();
@@ -420,12 +435,12 @@ function risk(la, lo, h, cs, rs) {
   /* Demo toggle: force a hotspot at the user's position */
   if (st.force) fc = .8 * bump(dist(pos.lat, pos.lng) / w, 150);
 
-  const raw    = hz + ic + fc + sm,
-        shield = Math.min(.6, sf * (1 + rp / .3) + rp),
+  const raw    = hz + ic + fc + sm + ld,
+        shield = Math.min(.6, sf * (1 + rp / .3) + rp + es),
         r      = Math.max(0, Math.min(1, raw - shield));
 
   return {
-    r, raw, shield, hz, cr: sf, rp, ic, sm, nz, people, nh, ni, dk, rd,
+    r, raw, shield, hz, cr: sf, rp, ic, sm, nz, people, nh, ni, dk, rd, es, ld, lit, ns,
     lvl:   r < .25 ? 0 : r < .55 ? 1 : 2,
     score: Math.round((1 - r) * 100)
   };
@@ -448,10 +463,10 @@ const head = (t, b = '') => `<header>${
 const topbar = s => `<header class="top"><div><h1 class="brand">TANGLAW</h1><p class="sub">${s}</p></div><span id="gps" class="chip"></span></header>`;
 
 /* Routes that hide the bottom dock (full-screen / detail views) */
-const DK = ['home', 'hub', 'reserve', 'reserved', 'requests', 'manage', 'pmap', 'chat', 'schedule', 'contacts', 'settings', 'admin'];
+const DK = ['home', 'hub', 'reserve', 'reserved', 'requests', 'manage', 'pmap', 'chat', 'schedule', 'contacts', 'settings', 'admin', 'console', 'a-users', 'a-inc', 'a-res', 'a-hz', 'a-places'];
 
 const dock = a => {
-  const on = { requests: 'reserve', reserved: 'reserve' }[a] || a;   // "My requests" highlights the Parks tab
+  const on = { requests: 'reserve', reserved: 'reserve', 'a-users': 'console', 'a-inc': 'console', 'a-res': 'console', 'a-hz': 'console', 'a-places': 'console' }[a] || a;   // "My requests" highlights the Parks tab
   return `<nav class="dock">${ROLES[role()].nav.map(([h, l]) => `
     <a href="#/${h}" class="${on == h ? 'on' : ''}">${l}<b class="bdg" data-bd="${h}" hidden></b></a>
   `).join('')}</nav>`;
@@ -483,7 +498,7 @@ const tag = s => `<em class="tag ${
                                              : 'wait'
 }">${s}</em>`;
 
-const btn = (a, id, to, l) => `<button class="mini go" data-act="${a}" data-id="${id}" data-to="${to}">${l}</button>`;
+const btn = (a, id, to, l) => `<button class="mini go" data-act="${a}" data-id="${esc(id)}" data-to="${to}">${l}</button>`;
 
 const HOURS = [
   ['',   'Now'],
@@ -495,7 +510,7 @@ const HOURS = [
 ];
 
 /* Risk colour key, shared by every map legend */
-const RK = '<span><i style="background:var(--lo)"></i>Low</span>' +
+const RK = '<span><i style="background:transparent;border:1px solid var(--mut)"></i>Low (no tint)</span>' +
            '<span><i style="background:var(--mid)"></i>Medium</span>' +
            '<span><i style="background:var(--hi)"></i>High</span>';
 
@@ -517,6 +532,12 @@ const authView = () => `
     <label>Name (new accounts)<input name="name" autocomplete="name"></label>
     <label>Email<input name="email" type="email" required autocomplete="email"></label>
     <label>Password<input name="pass" type="password" required minlength="6"></label>
+    <label>Language / Wika
+      <select name="lang">
+        <option value="en" ${st.lang != 'fil' ? 'selected' : ''}>English</option>
+        <option value="fil" ${st.lang == 'fil' ? 'selected' : ''}>Filipino</option>
+      </select>
+    </label>
     <label>I am a
       <select name="role">
         ${Object.keys(LABEL).map(k => `<option value="${k}">${LABEL[k]}</option>`).join('')}
@@ -533,7 +554,147 @@ const authView = () => `
   <p class="note">Prototype: accounts are stored only on this device.</p>
 `;
 
+/* ---------- Admin console (FR-15) ---------- */
+let AU = [], auSig = '', AINC = [], aiSig = '', TRF = {}, trSig = '';
+const aF = { inc: 'active', res: 'pending', hz: 'review' };
+const SVK = ['Police station', 'Hospital', 'Barangay hall', 'Well-lit area'];
+const fmtT = t => new Date(t).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' });
+
+const chips = (k, list) => `<div class="fchips">${list.map(([v, l, n]) =>
+  `<button class="mini ${aF[k] == v ? 'go' : ''}" data-act="afil" data-id="${k}:${v}">${l}${n != null ? ` (${n})` : ''}</button>`).join('')}</div>`;
+
+/* Foot traffic: today, last 7 days, busiest hour, and an hourly bar strip */
+function trafHTML(pid) {
+  const d = TRF[pid] || {}, tz = new Date().getTimezoneOffset() * 6e4,
+        sum = o => Object.values(o || {}).reduce((x, y) => x + y, 0),
+        day = d[today()] || {};
+  let wk = 0;
+  for (let k = 0; k < 7; k++) wk += sum(d[new Date(Date.now() - k * 864e5 - tz).toISOString().slice(0, 10)]);
+  const pk = Object.entries(day).sort((x, y) => y[1] - x[1])[0],
+        mx = Math.max(1, ...Object.values(day));
+  return `<div class="stats">
+      <div class="stat"><b>${sum(day)}</b><span>Visitors today</span></div>
+      <div class="stat"><b>${wk}</b><span>Last 7 days</span></div>
+      <div class="stat"><b>${pk ? f12(pk[0] + ':00') : '–'}</b><span>Busiest hour today</span></div>
+    </div>
+    <div class="tbars">${Array.from({ length: 16 }, (_, k) => k + 6).map(h => `<i style="height:${Math.max(4, Math.round((day[h] || 0) / mx * 100))}%"></i>`).join('')}</div>
+    <div class="axis"><span>6 AM</span><span>2 PM</span><span>10 PM</span></div>`;
+}
+
+const suspView = () => `
+  <h1 class="brand">TANGLAW</h1>
+  <div class="card"><b>Account suspended</b>
+    <p>An administrator has suspended this account. You cannot reserve parks or report hazards right now. Please contact your barangay office.</p></div>
+  <a class="btn sosbtn" href="tel:911">Call 911</a>
+  <button class="btn ghost" data-act="logout">Log out</button>`;
+
+async function syncAdmin() {
+  const r = route();
+  let ch = false;
+
+  if (r == 'a-users') {
+    const u = await api('users?all=1'), s = JSON.stringify(u);
+    if (s != auSig) { AU = u; auSig = s; ch = true; }
+  }
+  if (r == 'a-inc') {
+    const i = await api('incidents?all=1'), s = JSON.stringify(i.map(x => [x.id, x.status, x.responder?.id]));
+    if (s != aiSig) { AINC = i; aiSig = s; ch = true; }
+  }
+  if ((r == 'a-places' && role() == 'admin') || (r == 'manage' && role() == 'manager')) {
+    const t = await api('traffic' + (role() == 'manager' ? '?mid=' + st.user.id : '')), s = JSON.stringify(t);
+    if (s != trSig) { TRF = t; trSig = s; ch = true; }
+  }
+  if (ch) render();
+}
+
 const V = {
+
+  console: () => head('Manage') + [
+      ['a-users',  'Users',                    'Accounts: view, suspend or reactivate'],
+      ['a-inc',    'Incident reports',         `${hubData.length} active`],
+      ['a-res',    'Reservations',             `${RES.filter(r => r.status == 'Pending approval').length} pending`],
+      ['a-hz',     'Maintenance reports',      `${HZ.filter(h => h.status == 'Pending').length} to review`],
+      ['a-places', 'Parks and safety places',  `${PARKS.length} parks · ${SV.length} places`]
+    ].map(([h, t, s]) => `<a class="card" href="#/${h}"><b>${t}</b><span>${s}</span></a>`).join(''),
+
+  'a-users': () => head('Users', '#/console') +
+    '<p class="note">Citizens registered on this server. A suspended user cannot reserve parks or report hazards and sees a notice in the app. Emergency calling stays available.</p>' +
+    (AU.map(u => `<div class="row">
+        <div><b>${esc(u.name)}</b><span>${u.online ? 'Online now' : 'Offline'}</span></div>
+        <div>${u.suspended ? '<em class="tag no">Suspended</em> ' : ''}<button class="mini ${u.suspended ? 'go' : ''}" data-act="usus" data-id="${esc(u.id)}" data-to="${u.suspended ? 0 : 1}">${u.suspended ? 'Reactivate' : 'Suspend'}</button></div>
+      </div>`).join('') || '<p class="note">No registered users yet.</p>'),
+
+  'a-inc': () => {
+    const L = AINC.slice().sort((x, y) => y.created - x.created), f = aF.inc,
+          sh = L.filter(i => f == 'all' || (f == 'active' ? i.status < 3 : i.status == 3));
+    return head('Incident reports', '#/console') +
+      chips('inc', [['active', 'Active', L.filter(i => i.status < 3).length], ['done', 'Resolved', L.filter(i => i.status == 3).length], ['all', 'All', L.length]]) +
+      (sh.map(i => `<div class="card">
+          <b>${esc(i.type)}</b>
+          <span>${esc(i.by || 'Citizen')} · ${fmtT(i.created)}${i.note ? '<br>' + esc(i.note) : ''}</span><br>
+          <span><em>${STEPS[i.status][0]}</em>${i.responder ? ' · ' + esc(i.responder.name) : ''}</span><br>
+          ${i.status < 3 ? btn('ainc', i.id, 3, 'Mark resolved') : ''}
+          <a class="mini" target="_blank" rel="noopener" href="https://www.google.com/maps/dir/?api=1&destination=${i.lat},${i.lng}">Navigate</a>
+          <button class="mini" data-act="adel" data-id="inc:${i.id}">Delete</button>
+        </div>`).join('') || '<p class="note">No incidents here.</p>');
+  },
+
+  'a-res': () => {
+    const L = RES.slice().sort((x, y) => (x.date + x.start).localeCompare(y.date + y.start)),
+          pend = L.filter(r => r.status == 'Pending approval'),
+          up = L.filter(r => r.status == 'Approved' && upc(r)),
+          oth = L.filter(r => !pend.includes(r) && !up.includes(r)).reverse(),
+          sh = aF.res == 'pending' ? pend : aF.res == 'up' ? up : oth;
+    return head('Reservations', '#/console') +
+      chips('res', [['pending', 'Pending', pend.length], ['up', 'Upcoming', up.length], ['past', 'Past or cancelled', oth.length]]) +
+      (sh.map(r => `<div class="row">
+          <div>
+            <b>${esc(r.fac)}</b>
+            <span>${r.pname ? esc(r.pname) + ' · ' : ''}${esc(r.date)}, ${rng(r)}<br>${esc(r.by || '')}${r.purpose ? ' · ' + esc(r.purpose) : ''}${cxInfo(r)}</span><br>
+            ${r.status == 'Pending approval' ? btn('rs', r.id, 'Approved', 'Approve') + btn('rs', r.id, 'Rejected', 'Reject') : ''}
+            ${r.status == 'Approved' && upc(r) ? `<button class="mini" data-act="rcx" data-id="${esc(r.id)}">Cancel reservation</button>` : ''}
+          </div>
+          ${tag(r.status)}
+        </div>`).join('') || '<p class="note">Nothing here.</p>');
+  },
+
+  'a-hz': () => {
+    const by = s => HZ.filter(h => h.status == s).slice().reverse(),
+          sh = by({ review: 'Pending', active: 'Approved', fixed: 'Fixed', rejected: 'Rejected' }[aF.hz]);
+    return head('Maintenance reports', '#/console') +
+      chips('hz', [['review', 'To review', by('Pending').length], ['active', 'Active', by('Approved').length], ['fixed', 'Fixed', by('Fixed').length], ['rejected', 'Rejected', by('Rejected').length]]) +
+      (sh.map(h => `<div class="card">
+          ${h.photo ? `<img class="hzimg" src="/api/hazards/${esc(h.id)}/photo" loading="lazy" alt="">` : ''}
+          <b>${esc(h.cat)}</b>
+          <span>${esc(h.desc)}<br>${esc(h.by || 'Citizen')} · ${fmtT(h.created)}</span><br>
+          ${h.status == 'Pending' ? btn('hzs', h.id, 'Approved', 'Approve') + btn('hzs', h.id, 'Rejected', 'Reject') : ''}
+          ${h.status == 'Approved' ? btn('hzs', h.id, 'Fixed', 'Mark fixed') : ''}
+          <a class="mini" target="_blank" rel="noopener" href="https://www.google.com/maps/dir/?api=1&destination=${h.lat},${h.lng}">Navigate</a>
+          <button class="mini" data-act="adel" data-id="hz:${h.id}">Delete</button>
+        </div>`).join('') || '<p class="note">Nothing here.</p>');
+  },
+
+  'a-places': () => head('Parks and safety places', '#/console') + '<h2>Parks</h2>' +
+    (PARKS.map(p => `<div class="card">
+        <b>${esc(p.name)}</b>
+        <span>Park manager: ${esc(p.mname || '?')}</span><br>
+        ${p.closed ? '<em class="tag no">Temporarily closed</em> ' : ''}<button class="mini" data-act="pkcl" data-id="${esc(p.id)}" data-to="${p.closed ? 0 : 1}">${p.closed ? 'Reopen' : 'Close'}</button>
+        ${trafHTML(p.id)}
+      </div>`).join('') || '<p class="note">No parks yet.</p>') +
+    '<h2>Safety places</h2><p class="note">Police stations, hospitals and barangay halls lower the risk around them. Well-lit areas cancel the small extra risk after dark.</p>' +
+    (SV.map(s => `<div class="row"><div><b>${esc(s.name)}</b><span>${s.kind}</span></div><button class="mini" data-act="svdel" data-id="${esc(s.id)}">Remove</button></div>`).join('') || '<p class="note">No safety places yet.</p>') +
+    `<h2>Add a safety place</h2>
+    <form data-f="svc">
+      <label>Name<input name="name" required maxlength="60"></label>
+      <label>Type<select name="kind">${SVK.map(k => `<option>${k}</option>`).join('')}</select></label>
+      <div class="two">
+        <label>Latitude<input name="lat" required inputmode="decimal"></label>
+        <label>Longitude<input name="lng" required inputmode="decimal"></label>
+      </div>
+      <button type="button" class="btn ghost" data-act="svloc">Use my current location</button>
+      <button class="btn">Add place</button>
+    </form>`,
+
 
   /* Citizen home */
   home: () => {
@@ -541,7 +702,7 @@ const V = {
     return `${topbar('Kumusta, ' + esc(st.user.name))}
       <div id="map" class="map"></div>
       <div class="legend">
-        <span><i style="background:var(--lo)"></i>Low</span>
+        <span><i style="background:transparent;border:1px solid var(--mut)"></i>Low (no tint)</span>
         <span><i style="background:var(--mid)"></i>Medium</span>
         <span><i style="background:var(--hi)"></i>High</span>
         <span><i style="background:#e98a6b"></i>You</span>
@@ -579,6 +740,7 @@ const V = {
     const pr = RES.filter(r => r.status == 'Pending approval' && owns(r)),
           sortT = (x, y) => (x.date + x.start).localeCompare(y.date + y.start),
           ap = RES.filter(r => r.status == 'Approved' && owns(r) && upc(r)).sort(sortT),
+          mine = PARKS.filter(p => p.mid == st.user.id),
           cx = RES.filter(r => r.status == 'Cancelled' && owns(r)).slice().sort((x, y) => (y.cancelled || 0) - (x.cancelled || 0)).slice(0, 5);
     return head('Reservation requests') +
       (pr.map(r => `<div class="row">
@@ -587,13 +749,13 @@ const V = {
             <span>${r.pname ? esc(r.pname) + ' · ' : ''}${esc(r.date)}, ${rng(r)}<br>${esc(r.by || '')}${r.purpose ? ' · ' + esc(r.purpose) : ''}</span><br>
             ${btn('rs', r.id, 'Approved', 'Approve')}${btn('rs', r.id, 'Rejected', 'Reject')}
           </div>
-        </div>`).join('') || `<p class="note">No pending requests for your parks.${!mine().length ? ' This account has no parks yet. Add one on the Map tab. Parks added under a different account are not shown here.' : ''}</p>`) +
+        </div>`).join('') || '<p class="note">No pending requests for your parks.</p>') +
       `<h2>Approved reservations</h2>` +
       (ap.map(r => `<div class="row">
           <div>
             <b>${esc(r.fac)}</b>
             <span>${r.pname ? esc(r.pname) + ' · ' : ''}${esc(r.date)}, ${rng(r)}<br>${esc(r.by || '')}${r.purpose ? ' · ' + esc(r.purpose) : ''}</span><br>
-            <button class="mini" data-act="rcx" data-id="${r.id}">Cancel reservation</button>
+            <button class="mini" data-act="rcx" data-id="${esc(r.id)}">Cancel reservation</button>
           </div>
           ${tag('Approved')}
         </div>`).join('') || '<p class="note">No upcoming approved reservations.</p>') +
@@ -601,6 +763,8 @@ const V = {
           <div><b>${esc(r.fac)}</b><span>${r.pname ? esc(r.pname) + ' · ' : ''}${esc(r.date)}, ${rng(r)}${cxInfo(r)}</span></div>
           ${tag('Cancelled')}
         </div>`).join('') : '') +
+      (mine.length ? `<h2>Foot traffic</h2>` + mine.map(p => `<div class="card"><b>${esc(p.name)}</b>${trafHTML(p.id)}</div>`).join('') +
+        '<p class="note">Counts of app users who were inside the park area, per hour. Only counts are kept, never names or trails.</p>' : '') +
       '<p class="note">You only see requests for parks you added. Open the Schedule tab to see what is booked for a facility. Reservations are also cancelled automatically when a park is closed, or an incident near it stays unresolved for more than 30 minutes.</p>';
   },
 
@@ -683,7 +847,7 @@ const V = {
     </div>
     <div class="fchips">
       ${[['all', 'Everyone'], ['citizen', 'Citizens'], ['responder', 'Responders'], ['manager', 'Park managers']]
-        .map(([k, l]) => `<button class="mini ${adminF == k ? 'go' : ''}" data-act="pf" data-id="${k}">${l}</button>`).join('')}
+        .map(([k, l]) => `<button class="mini ${adminF == k ? 'go' : ''}" data-act="pf" data-id="${esc(k)}">${l}</button>`).join('')}
     </div>
     <h2>People</h2>
     <div id="plist"></div>
@@ -757,7 +921,7 @@ const V = {
     return head('Parks') + tabs('requests') +
       (m.length
         ? m.map(r => `<div class="row">
-            <div><b>${esc(r.fac)}</b><span>${r.pname ? esc(r.pname) + ' · ' : ''}${esc(r.date)}, ${rng(r)}${cxInfo(r)}</span>${(r.status == 'Pending approval' || r.status == 'Approved') && upc(r) ? `<br><button class="mini" data-act="rcx" data-id="${r.id}">Cancel reservation</button>` : ''}</div>
+            <div><b>${esc(r.fac)}</b><span>${r.pname ? esc(r.pname) + ' · ' : ''}${esc(r.date)}, ${rng(r)}${cxInfo(r)}</span>${(r.status == 'Pending approval' || r.status == 'Approved') && upc(r) ? `<br><button class="mini" data-act="rcx" data-id="${esc(r.id)}">Cancel reservation</button>` : ''}</div>
             ${tag(r.status)}
           </div>`).join('')
         : '<p class="note">No requests yet. Use the Reserve tab to book a facility.</p>') +
@@ -773,7 +937,7 @@ const V = {
       <label>Describe the hazard<textarea name="desc" rows="3" required maxlength="300"></textarea></label>
       <button class="btn">Submit for review</button>
     </form>
-    <p class="note">A responder reviews each report. Approved hazards raise the risk level of that area until fixed.</p>
+    <p class="note">Your report raises the risk level of that area right away. A responder, park manager or admin then verifies it, and the area recovers once it is fixed.</p>
     <h2>Your reports</h2>
     <div id="mine"></div>`,
 
@@ -783,7 +947,7 @@ const V = {
     <label>Search by name<input id="ctq" type="search" placeholder="Type at least 2 letters" autocomplete="off"></label>
     <div id="ctres"></div>
     <p class="note">They must have a TANGLAW account and accept your request. Once they do, they receive your alerts and you can see each other on the map while you are both online and sharing location.</p>` +
-    (st.links.length ? `<a class="btn ghost" href="#/link/${st.links.at(-1).id}">Preview what a contact receives</a>` : ''),
+    (st.links.length ? `<a class="btn ghost" href="#/link/${esc(st.links.at(-1).id)}">Preview what a contact receives</a>` : ''),
 
   link: () => head('Secure expiring link', '#/contacts') + `
     <div id="map2" class="map sm"></div>
@@ -792,7 +956,18 @@ const V = {
   settings: () => head('Settings') + `
     <div class="row">
       <div><b>${esc(st.user.name)}</b><span>${LABEL[role()]} · ${esc(st.user.email)}</span></div>
-    </div>` +
+    </div>
+    <label>Language / Wika
+      <select name="lang">
+        <option value="en" ${st.lang != 'fil' ? 'selected' : ''}>English</option>
+        <option value="fil" ${st.lang == 'fil' ? 'selected' : ''}>Filipino</option>
+      </select>
+    </label>` +
+    (role() == 'citizen' ? `<label>Check-in prompt after staying in a High Risk zone
+      <select name="lim">
+        ${[3, 5, 10].map(n => `<option value="${n}" ${(st.lim || 5) == n ? 'selected' : ''}>${n} minutes</option>`).join('')}
+      </select>
+    </label>` : '') +
     (role() != 'admin' ? `<label class="chk">
         <input type="checkbox" data-act="share" ${st.share !== false ? 'checked' : ''}>
         <span>Share my live location with barangay officials<br><small>Only while the app is open. Not saved as a trail. Also counts anonymously toward crowd levels.${
@@ -802,7 +977,7 @@ const V = {
       </label>` : '') +
     (role() == 'citizen' ? `<label class="chk">
         <input type="checkbox" data-act="demo" ${st.demo ? 'checked' : ''}>
-        <span>Demo mode<br><small>Check-in after 10 s instead of 5 min. Links expire after 1 min.</small></span>
+        <span>Demo mode<br><small>Check-in after 10 s instead of your chosen time. Links expire after 1 min.</small></span>
       </label>
       <label class="chk">
         <input type="checkbox" data-act="force" ${st.force ? 'checked' : ''}>
@@ -836,7 +1011,7 @@ let M = null, ML = null, RL = null, follow = true, mapSig = '', rkey = '',
 
 const CHS = { mgr: [], resp: [] };   // chat messages per channel
 
-const ZC = ['#8fcfa5', '#f4cf72', '#f1938f']; // low / medium / high fills
+const ZC = ['', '#f4cf72', '#f1938f'];   // medium / high fills (Low is left untinted, so index 0 is unused)
 
 /* Maps that show the risk layer (every role's home map) and how far out they can zoom */
 const MINZ = { home: 16, hub: 15, pmap: 15, admin: 14 };
@@ -920,7 +1095,7 @@ function riskLayer() {
 
   const key = [
     cl.toFixed(4), co.toFixed(4), Math.round(h * 4),
-    hzSigA(), sgSig,
+    hzSigA(), sgSig, svSig,
     st.force ? pos.lat.toFixed(4) + pos.lng.toFixed(4) : '',
     st.crowdSim ? pos.lat.toFixed(4) + pos.lng.toFixed(4) : '',
     st.respSim ? pos.lat.toFixed(4) + pos.lng.toFixed(4) : '',
@@ -939,9 +1114,8 @@ function riskLayer() {
 
   const P = { pane: 'rzone', interactive: false, weight: 1, fillOpacity: 1, opacity: 1 };
 
-  // Everything is Low by default.
-  L.rectangle([[la0, lo0], [la0 + 2 * N * G, lo0 + 2 * N * G]],
-    { ...P, color: ZC[0], fillColor: ZC[0], weight: 0 }).addTo(RL);
+  // Low is the default and is left untinted, so the map shows its own colours there.
+  // Only Medium and High are drawn as overlays.
 
   [[.25, 1], [.55, 2]].forEach(([t, k]) => {
     const polys = [];
@@ -978,7 +1152,7 @@ function simMarkers(la0, lo0, span) {
     }
 }
 
-const hzSigA = () => HZA.map(h => h.id).join();
+const hzSigA = () => HZA.map(h => h.id + h.status).join();
 
 /* Recenter button on every map (top right) */
 function addRecenter() {
@@ -1158,6 +1332,10 @@ function drawMap() {
          .bindTooltip(esc(h.cat) + (p ? ' (pending review)' : '')).addTo(ML);
       });
 
+  if (big && ['home', 'hub', 'admin', 'pmap'].includes(r))
+    SV.forEach(s => L.circleMarker([s.lat, s.lng], { radius: 6, color: '#fff', weight: 2, fillColor: s.kind == 'Well-lit area' ? '#e0b430' : '#3d5c9c', fillOpacity: 1 })
+      .bindTooltip(esc(s.name) + ' · ' + s.kind).addTo(ML));
+
   if (adm)
     PEOPLE.filter(p => adminF == 'all' || p.role == adminF)
       .forEach(p => L.circleMarker([p.lat, p.lng], { radius: 8, color: '#fff', weight: 2, fillColor: RC[p.role] || '#999', fillOpacity: 1 })
@@ -1176,6 +1354,7 @@ function drawMap() {
 
 /* ---------- Render ---------- */
 function render() {
+  document.documentElement.lang = st.lang == 'fil' ? 'fil' : 'en';
   sig = '';
   hubSig = '';
   hubHtml = '';
@@ -1184,6 +1363,11 @@ function render() {
 
   if (!st.in) {
     app.innerHTML = authView();
+    return;
+  }
+
+  if (role() == 'citizen' && st.suspended) {
+    app.innerHTML = suspView();
     return;
   }
 
@@ -1208,6 +1392,7 @@ function render() {
 
   badges();
   syncData().catch(() => {});
+  if (role() == 'admin' || role() == 'manager') syncAdmin().catch(() => {});
   sync();
 }
 
@@ -1244,10 +1429,13 @@ function drawTracker() {
     bar('Recent incidents', a.ic / .5) +
     bar('Crowd nearby (adds safety)', a.cr / .4, 'var(--lo)') +
     bar('Responder nearby (adds safety)', a.rp / .3, 'var(--lo)') +
+    bar('Police, hospital or barangay hall nearby (adds safety)', a.es / .2, 'var(--lo)') +
+    bar('Street lighting after dark', a.ld / .12) +
+    `<div><span>Nearest emergency service</span><em>${a.ns && a.ns.d < 1000 ? esc(a.ns.name) : 'None nearby'}</em></div>` +
     `<div><span>People within 100 m</span><em>${a.people} · ${cw}</em></div>` +
     `<div><span>Nearest on-duty responder</span><em>${a.rd != null && a.rd < 600 ? 'about ' + Math.round(a.rd / 10) * 10 + ' m' : 'None nearby'}</em></div>` +
     `<div><span>Time of day</span><em>${tlabel(h)}${a.dk > 0 ? ' · raises risk' : ''}</em></div>` +
-    `<div><span>Approved hazards within 150 m</span><em>${a.nh}</em></div>`;
+    `<div><span>Hazard reports within 150 m</span><em>${a.nh}</em></div>`;
 }
 
 /* ---------- Reservation availability ---------- */
@@ -1373,7 +1561,7 @@ function drawMine() {
   const m = HZ.filter(h => h.uid == st.user.id).slice().reverse();
   el.innerHTML = m.length
     ? m.map(h => `<div class="row">
-        ${h.photo ? `<img class="thumb" src="/api/hazards/${h.id}/photo" alt="">` : ''}
+        ${h.photo ? `<img class="thumb" src="/api/hazards/${esc(h.id)}/photo" alt="">` : ''}
         <div><b>${esc(h.cat)}</b><span>${esc(h.desc)}</span></div>
         ${tag(h.status == 'Pending' ? 'Pending review' : h.status)}
       </div>`).join('')
@@ -1406,7 +1594,7 @@ const ago = t => {
   return m < 1 ? 'just now' : m + ' min ago';
 };
 
-let hzSig = '', resSig = '', sgSig = '', busy = 0, lastPres = 0,
+let hzSig = '', resSig = '', sgSig = '', svSig = '', busy = 0, lastPres = 0,
     CT = [], AL = [], ctSig = '', seenAl = new Set();
 
 /* Parks that managers pinned. Everyone reads them: citizens pick one to reserve, managers see their own. */
@@ -1430,15 +1618,25 @@ async function syncData() {
 
   if (hs != hzSig) {
     HZ = h;
-    HZA = h.filter(x => x.status == 'Approved');
+    HZA = h.filter(x => x.status == 'Approved' || x.status == 'Pending');
     hzSig = hs;
     sig = '';
     if (r0 == 'hub') renderHub();
     else if (r0 == 'report') drawMap(), drawMine();
-    else drawMap();
+    else if (r0 == 'a-hz' || r0 == 'console') render();
+    else { drawMap(); if (r0 == 'pmap') drawPM(); }
   }
 
   await syncParks().catch(() => {});
+
+  const sv = await api('services').catch(() => SV), ss = JSON.stringify(sv);
+  if (ss != svSig) {
+    SV = sv;
+    svSig = ss;
+    sig = '';
+    if (r0 == 'a-places') render();
+    else { drawMap(); if (hasRisk()) drawTracker(); }
+  }
 
   const g = await api('signals'), gs = JSON.stringify(g);
   if (gs != sgSig) {
@@ -1449,19 +1647,42 @@ async function syncData() {
   }
 
   // Managers need reservations everywhere (for the Requests badge), others only on their own screens.
-  if (role() == 'manager' || ['reserve', 'reserved', 'requests', 'manage', 'schedule', 'admin'].includes(r0)) {
+  if (role() == 'manager' || role() == 'citizen' || ['manage', 'schedule', 'admin', 'console', 'a-res'].includes(r0)) {
     const rr = await api('reservations'),
           rs = JSON.stringify(rr.map(x => [x.id, x.status]));
     if (rs != resSig) {
       RES = rr;
       resSig = rs;
-      if (r0 == 'requests' || r0 == 'reserved' || r0 == 'manage') render();
+      notifyRes(rr);
+      if (r0 == 'requests' || r0 == 'reserved' || r0 == 'manage' || r0 == 'a-res' || r0 == 'console') render();
       else if (r0 == 'admin') drawAdmin();
       else if (r0 == 'reserve' || r0 == 'schedule') drawAvail();
     }
   }
 
   badges();
+}
+
+/* In-app notice when a reservation you made is approved, declined or cancelled by someone else */
+function notifyRes(rr) {
+  if (role() != 'citizen') return;
+  const mine = rr.filter(r => r.uid == st.user.id);
+  if (!st.resSeen) {
+    st.resSeen = Object.fromEntries(mine.map(r => [r.id, r.status]));
+    save();
+    return;
+  }
+  for (const r of mine) {
+    const was = st.resSeen[r.id];
+    if (was && was != r.status && r.cancelBy != 'citizen') {
+      const what = `${r.fac}, ${r.date}`;
+      if (r.status == 'Approved') toast('Reservation approved: ' + what);
+      else if (r.status == 'Rejected') toast('Reservation declined: ' + what);
+      else if (r.status == 'Cancelled') toast('Reservation cancelled: ' + what + (r.cancelReason ? ` (${r.cancelReason})` : ''));
+    }
+    st.resSeen[r.id] = r.status;
+  }
+  save();
 }
 
 function presence() {
@@ -1489,6 +1710,7 @@ async function sync() {
     }
 
     if (R == 'manager') await syncMgr().catch(() => {});
+    if (R == 'admin' || R == 'manager') await syncAdmin().catch(() => {});
     if (R != 'citizen') await syncChat().catch(() => {});
 
     if (R == 'citizen') {
@@ -1557,7 +1779,7 @@ const closeOv = () => { ov.hidden = true; ov.innerHTML = ''; };
 function openCancel(id) {
   const r = RES.find(x => x.id == id);
   if (!r) return;
-  const mgr = role() == 'manager';
+  const mgr = role() != 'citizen';
   ov.hidden = false;
   ov.innerHTML = `<div class="sheet">
       <h2>Cancel reservation?</h2>
@@ -1623,24 +1845,24 @@ function hubPanelHTML() {
 
   const tabs = `<nav class="tabs">${
     [['inc', 'Incidents', inc.length], ['hz', 'Hazards', ph.length], ['team', 'Team', team.length]]
-      .map(([k, l, n]) => `<button type="button" class="${hubTab == k ? 'on' : ''}" data-act="htab" data-id="${k}">${l}${n ? ` (${n})` : ''}</button>`).join('')
+      .map(([k, l, n]) => `<button type="button" class="${hubTab == k ? 'on' : ''}" data-act="htab" data-id="${esc(k)}">${l}${n ? ` (${n})` : ''}</button>`).join('')
   }</nav>`;
 
   if (hubTab == 'hz') {
     const hc = (h, x) => `<div class="card">
-        ${h.photo ? `<img class="hzimg" src="/api/hazards/${h.id}/photo" loading="lazy" alt="">` : ''}
+        ${h.photo ? `<img class="hzimg" src="/api/hazards/${esc(h.id)}/photo" loading="lazy" alt="">` : ''}
         <b>${esc(h.cat)}</b>
         <span>${esc(h.desc)}<br>${esc(h.by || 'Citizen')} · ${km(pos.lat, pos.lng, h.lat, h.lng).toFixed(1)} km away · ${ago(h.created)}</span><br>
         ${x}
         <a class="mini" target="_blank" rel="noopener" href="https://www.google.com/maps/dir/?api=1&destination=${h.lat},${h.lng}">Navigate</a>
-        <button class="mini" data-act="hzf" data-id="${h.id}">Show on map</button>
+        <button class="mini" data-act="hzf" data-id="${esc(h.id)}">Show on map</button>
       </div>`;
     return tabs + `
       <h2>To review (${ph.length})</h2>
       ${ph.map(h => hc(h, btn('hzs', h.id, 'Approved', 'Approve') + btn('hzs', h.id, 'Rejected', 'Reject'))).join('') || '<p class="note">Nothing to review.</p>'}
       <h2>Active hazards (${ap.length})</h2>
       ${ap.map(h => hc(h, btn('hzs', h.id, 'Fixed', 'Mark fixed'))).join('') || '<p class="note">No active hazards.</p>'}
-      <p class="note">Approved hazards raise the risk level around them until marked fixed.</p>`;
+      <p class="note">Reported hazards raise the risk level around them (half weight until approved) until marked fixed.</p>`;
   }
 
   if (hubTab == 'team')
@@ -1651,7 +1873,7 @@ function hubPanelHTML() {
             <span><i class="dot" style="background:${RC.responder}"></i>On duty · ${x.d.toFixed(1)} km away · seen ${ago(x.ts)}</span>
           </div>
           <div>
-            <button class="mini" data-act="rsf" data-id="${x.id}">Show</button>
+            <button class="mini" data-act="rsf" data-id="${esc(x.id)}">Show</button>
             <a class="mini" href="#/chat">Message</a>
           </div>
         </div>`).join('')
@@ -1660,7 +1882,7 @@ function hubPanelHTML() {
 
   return tabs + (inc.length ? inc.map(i => {
     const own = i.responder?.id == me,
-          go = (to, l) => `<button class="mini go" data-act="inc" data-id="${i.id}" data-to="${to}">${l}</button>`;
+          go = (to, l) => `<button class="mini go" data-act="inc" data-id="${esc(i.id)}" data-to="${to}">${l}</button>`;
     return `<div class="card ${i.nearest == me ? 'inc' : ''}">
         <b>${esc(i.type)}</b>
         <span>${esc(i.by || 'Citizen')} · ${i.d.toFixed(1)} km away · ${ago(i.created)}${i.nearest == me ? ' · nearest to you' : ''}</span>
@@ -1670,7 +1892,7 @@ function hubPanelHTML() {
         ${own && i.status == 1 ? go(2, 'Mark arrived') : ''}
         ${own && i.status == 2 ? go(3, 'Mark resolved') : ''}
         <a class="mini" target="_blank" rel="noopener" href="https://www.google.com/maps/dir/?api=1&destination=${i.lat},${i.lng}">Navigate</a>
-        <button class="mini" data-act="focus" data-id="${i.id}">Show on map</button>
+        <button class="mini" data-act="focus" data-id="${esc(i.id)}">Show on map</button>
       </div>`;
   }).join('') : '<p class="note">No active incidents.</p>');
 }
@@ -1721,8 +1943,8 @@ function drawAdmin() {
         </span>
       </div>
       <div>
-        <button class="mini" data-act="pfocus" data-id="${p.id}">Show</button>
-        ${p.role == 'citizen' ? '' : `<a class="mini" href="#/chat" data-act="chto" data-id="${p.role == 'responder' ? 'resp' : 'mgr'}">Message</a>`}
+        <button class="mini" data-act="pfocus" data-id="${esc(p.id)}">Show</button>
+        ${p.role == 'citizen' ? '' : `<a class="mini" href="#/chat" data-act="chto" data-id="${esc(p.role == 'responder' ? 'resp' : 'mgr')}">Message</a>`}
       </div>
     </div>`).join('') || '<p class="note">Nobody is online with location sharing on.</p>';
 
@@ -1816,11 +2038,12 @@ function drawPM() {
       ? '<p class="note">Add a park below to see hazards around it.</p>'
       : rows.length
         ? rows.map(({ h: x, p, d }) => `<div class="card">
-            ${x.photo ? `<img class="hzimg" src="/api/hazards/${x.id}/photo" loading="lazy" alt="">` : ''}
+            ${x.photo ? `<img class="hzimg" src="/api/hazards/${esc(x.id)}/photo" loading="lazy" alt="">` : ''}
             <b>${esc(x.cat)}</b>
             <span>${esc(x.desc)}<br>${Math.round(d / 10) * 10} m from ${esc(p.name)} · ${ago(x.created)}</span><br>
             ${tag(x.status == 'Pending' ? 'Pending review' : x.status)}
-            <button class="mini" data-act="hzf" data-id="${x.id}">Show on map</button>
+            ${x.status == 'Pending' ? btn('hzs', x.id, 'Approved', 'Approve') + btn('hzs', x.id, 'Rejected', 'Reject') : x.status == 'Approved' ? btn('hzs', x.id, 'Fixed', 'Mark fixed') : ''}
+            <button class="mini" data-act="hzf" data-id="${esc(x.id)}">Show on map</button>
           </div>`).join('')
         : '<p class="note">No reported hazards near your parks.</p>';
   }
@@ -1837,7 +2060,7 @@ function drawPM() {
                 <span><i class="dot" style="background:${RC.manager}"></i>${pk ? pk + ' · ' : ''}seen ${ago(m.ts)}</span>
               </div>
               <div>
-                <button class="mini" data-act="mgf" data-id="${m.id}">Show</button>
+                <button class="mini" data-act="mgf" data-id="${esc(m.id)}">Show</button>
                 <a class="mini" href="#/chat">Message</a>
               </div>
             </div>`;
@@ -1850,9 +2073,9 @@ function drawPM() {
     ? ps.map(p => `<div class="row">
         <div><b>${esc(p.name)}</b><span>${p.r} m around the pin${p.closed ? ' · Temporarily closed' : ''}</span></div>
         <div>
-          <button class="mini" data-act="pkcl" data-id="${p.id}" data-to="${p.closed ? 0 : 1}">${p.closed ? 'Reopen' : 'Close'}</button>
-          <button class="mini" data-act="pkf" data-id="${p.id}">Show</button>
-          <button class="mini" data-act="pkrm" data-id="${p.id}">Remove</button>
+          <button class="mini" data-act="pkcl" data-id="${esc(p.id)}" data-to="${p.closed ? 0 : 1}">${p.closed ? 'Reopen' : 'Close'}</button>
+          <button class="mini" data-act="pkf" data-id="${esc(p.id)}">Show</button>
+          <button class="mini" data-act="pkrm" data-id="${esc(p.id)}">Remove</button>
         </div>
       </div>`).join('')
     : '<p class="note">No parks yet. Add one below so hazards around it show up here.</p>';
@@ -1886,7 +2109,12 @@ let lastReg = 0;
 function regUser() {
   if (role() != 'citizen' || Date.now() - lastReg < 6e4) return;
   lastReg = Date.now();
-  return api('users', { id: st.user.id, name: st.user.name }).catch(() => { lastReg = 0; });
+  return api('users', { id: st.user.id, name: st.user.name })
+    .then(r => {
+      const s = !!r.suspended;
+      if (s != !!st.suspended) { st.suspended = s; save(); render(); }
+    })
+    .catch(() => { lastReg = 0; });
 }
 
 /* ---------- Contacts: search by name, consent required ---------- */
@@ -1897,6 +2125,18 @@ async function syncContacts() {
     api('alerts?to=' + me),
     api('nearby?uid=' + me).catch(() => [])
   ]);
+  if (st.pendingAlert) {
+    const pa = st.pendingAlert;
+    if (Date.now() > pa.exp) { st.pendingAlert = null; save(); }
+    else {
+      await api('alerts', pa);
+      st.links.push({ id: pa.id, exp: pa.exp });
+      st.pendingAlert = null;
+      save();
+      toast('Alert sent to your contacts.');
+    }
+  }
+
   const s = JSON.stringify([c, a.map(x => x.id)]);
 
   // Accepted contacts who are online and sharing appear on the map.
@@ -1936,7 +2176,7 @@ function drawContacts() {
 
   const al = AL.length
     ? `<h2>Alerts for you</h2>${
-        AL.map(x => `<a class="card inc" href="#/link/${x.id}">
+        AL.map(x => `<a class="card inc" href="#/link/${esc(x.id)}">
             <b>${esc(x.name)} may need help</b>
             <span>Tap to see their live location. Expires automatically.</span>
           </a>`).join('')
@@ -1963,7 +2203,7 @@ function drawContacts() {
             ${c.status == 'declined'
               ? `<button class="mini go" data-act="ctadd" data-id="${esc(c.to.id)}" data-n="${esc(c.to.name)}">Ask again</button>`
               : ''}
-            <button class="mini" data-act="ctrm" data-id="${c.id}">Remove</button>
+            <button class="mini" data-act="ctrm" data-id="${esc(c.id)}">Remove</button>
           </span>
         </div>
         ${tag(c.status == 'accepted' ? 'Consent accepted' : c.status == 'declined' ? 'Declined' : 'Consent pending')}
@@ -1976,7 +2216,7 @@ function drawContacts() {
         acc.map(c => `<div class="row">
             <div>
               <b>${esc(c.from.name)}</b>
-              <span><button class="mini" data-act="ctrm" data-id="${c.id}">Stop</button></span>
+              <span><button class="mini" data-act="ctrm" data-id="${esc(c.id)}">Stop</button></span>
             </div>
             ${tag('Accepted')}
           </div>`).join('')
@@ -2086,7 +2326,8 @@ async function escalate() {
       st.links.push({ id, exp });
       msg = `Alert sent to ${to.length} contact${to.length > 1 ? 's' : ''} with an expiring location link.`;
     } catch {
-      msg = 'Could not reach the server, so the alert was not sent. Call your contacts or 911.';
+      st.pendingAlert = { id, name: st.user.name, to, lat: pos.lat, lng: pos.lng, exp };
+      msg = 'No connection. Your alert will be sent automatically as soon as you are back online. You can also call your contacts or 911.';
     }
   } else {
     msg = 'No contact has accepted yet, so no alert was sent. Add contacts in Contacts.';
@@ -2178,10 +2419,7 @@ document.addEventListener('submit', async e => {
         catch { return toast('Invalid access code for that role, or the server is unreachable.'); }
       }
 
-      // Staff IDs come from role + email, so the same staff account gets the same ID on every device or tunnel link.
-      // (Random IDs made a park manager lose their parks, and their pending requests, whenever the account was recreated.)
-      const sid = (rl + ':' + em.toLowerCase()).split('').reduce((h, c) => (Math.imul(h, 31) + c.charCodeAt(0)) >>> 0, 7).toString(36);
-      st.user = { id: rl == 'citizen' ? uid() : 'm' + sid, name: d.name.trim(), email: em, pass: d.pass, role: rl, code: rl == 'citizen' ? '' : d.code };
+      st.user = { id: uid(), name: d.name.trim(), email: em, pass: d.pass, role: rl, code: rl == 'citizen' ? '' : d.code };
       st.duty = false;
       st.dutySince = null;
     } else if (!st.user || st.user.email != em || st.user.pass != d.pass) {
@@ -2214,7 +2452,7 @@ document.addEventListener('submit', async e => {
     } catch (x) {
       await syncData().catch(() => {});
       drawAvail();
-      return toast(x.message == '423' ? 'This park is temporarily closed today. Pick another day.' : x.message == '409' ? 'Someone just took that time. Pick another window.' : 'Could not send. Check your connection and try again.');
+      return toast(x.message == '403' ? 'Your account is suspended. Contact your barangay office.' : x.message == '423' ? 'This park is temporarily closed today. Pick another day.' : x.message == '409' ? 'Someone just took that time. Pick another window.' : 'Could not send. Check your connection and try again.');
     }
 
     await syncData().catch(() => {});
@@ -2222,8 +2460,18 @@ document.addEventListener('submit', async e => {
     location.hash = '#/requests';
   }
 
+  if (f == 'svc') {
+    if (!isFinite(+d.lat) || !isFinite(+d.lng)) return toast('Enter valid coordinates.');
+    try { await api('services', { id: uid(), kind: d.kind, name: d.name.trim(), lat: +d.lat, lng: +d.lng }); }
+    catch { return toast('Could not save. Check your connection and try again.'); }
+    svSig = '';
+    await syncData().catch(() => {});
+    toast('Place added.');
+    return;
+  }
+
   if (f == 'rcancel') {
-    const mgr = role() == 'manager', note = (d.note || '').trim();
+    const mgr = role() != 'citizen', note = (d.note || '').trim();
     if (mgr && !d.rsn) return toast('Choose a reason.');
     if (mgr && d.rsn == 'Other' && !note) return toast('Tell the citizen why you are cancelling.');
     try {
@@ -2317,7 +2565,7 @@ document.addEventListener('submit', async e => {
     mapSig = '';
     drawMap();
     drawMine();
-    toast('Submitted. A responder will review it before the map changes.');
+    toast('Submitted. It already raises the risk level there. A responder, park manager or admin will verify it.');
   }
 });
 
@@ -2343,6 +2591,21 @@ document.addEventListener('change', e => {
   if (e.target.name == 'park' && route() == 'reserve') pickPark(e.target.value);
 
   if (e.target.name == 'rvpark') { rvPark = e.target.value; render(); }
+
+  if (e.target.name == 'lim') { st.lim = +e.target.value; save(); toast('Saved.'); return; }
+
+  if (e.target.name == 'lang') {
+    const frm = e.target.closest('form'), draft = frm ? Object.fromEntries(new FormData(frm)) : null;
+    st.lang = e.target.value == 'fil' ? 'fil' : 'en';
+    save();
+    render();
+    const f2 = draft && $('form[data-f=auth]');
+    if (f2) {                       // keep what was already typed on the sign-in form
+      Object.entries(draft).forEach(([k, v]) => { if (k != 'lang' && f2.elements[k]) f2.elements[k].value = v; });
+      f2.elements.role?.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+    return;
+  }
 
   if (e.target.name == 'rsn') {
     const n = document.querySelector('#ov [name=note]'), o = e.target.value == 'Other';
@@ -2465,6 +2728,46 @@ document.addEventListener('click', e => {
 
   if (a == 'rcx') { openCancel(i); return; }
 
+  if (a == 'afil') { const [k, v] = i.split(':'); aF[k] = v; render(); return; }
+
+  if (a == 'usus') {
+    api('users/' + i, { suspended: t.dataset.to == '1' }, 'PATCH')
+      .then(() => { auSig = ''; return syncAdmin(); })
+      .then(() => toast(t.dataset.to == '1' ? 'Account suspended.' : 'Account reactivated.'))
+      .catch(fail);
+    return;
+  }
+
+  if (a == 'ainc') {
+    api('incidents/' + i, { status: 3 }, 'PATCH')
+      .then(() => { aiSig = ''; return syncAdmin(); })
+      .then(() => toast('Incident marked resolved.'))
+      .catch(fail);
+    return;
+  }
+
+  if (a == 'adel') {
+    const [k, id] = i.split(':');
+    if (!confirm(T('Delete this record permanently?'))) return;
+    api((k == 'inc' ? 'incidents/' : 'hazards/') + id, {}, 'DELETE')
+      .then(() => { aiSig = ''; hzSig = ''; return Promise.all([syncAdmin(), syncData()]); })
+      .then(() => toast('Deleted.'))
+      .catch(fail);
+    return;
+  }
+
+  if (a == 'svdel') {
+    api('services/' + i, {}, 'DELETE').then(syncData).then(() => toast('Place removed.')).catch(fail);
+    return;
+  }
+
+  if (a == 'svloc') {
+    if (!pos.live) return toast('Location is not available yet.');
+    document.querySelector('[name=lat]').value = pos.lat.toFixed(6);
+    document.querySelector('[name=lng]').value = pos.lng.toFixed(6);
+    return;
+  }
+
   if (a == 'pkcl') {
     const closing = t.dataset.to == '1';
     api('parks/' + i, { mid: st.user.id, closed: closing, reason: closing ? 'Closed by the park manager' : '' }, 'PATCH')
@@ -2483,7 +2786,7 @@ document.addEventListener('click', e => {
       .then(() => toast(
         a == 'hzs' && to == 'Approved' ? 'Approved. The area’s risk level is updated.' :
         a == 'hzs' && to == 'Fixed'    ? 'Marked fixed. The area’s risk level recovers.' :
-        `Marked ${to.toLowerCase()}.`
+        to == 'Approved' ? 'Marked approved.' : 'Marked rejected.'
       ))
       .catch(fail);
     return;
@@ -2555,6 +2858,59 @@ document.addEventListener('click', e => {
   save();
   render();
 });
+
+/* ---------- Language: English / Filipino ----------
+   Screens are written in English. When Filipino is chosen, text is translated as it is added to the page,
+   using the dictionary in lang.js. Anything not in the dictionary (names, places, dates) stays as it is. */
+const lang = () => st.lang == 'fil' ? 'fil' : 'en';
+const norm = s => s.replace(/\s+/g, ' ').trim();
+
+function trStr(raw) {
+  const k = norm(raw);
+  if (!k || !window.FIL) return raw;
+  let v = FIL[k];
+  if (v == null) for (const [re, f] of FILX) { const m = k.match(re); if (m) { v = f(...m.slice(1)); break; } }
+  if (v == null) return raw;
+  return raw.match(/^\s*/)[0] + v + raw.match(/\s*$/)[0];
+}
+
+const T = s => lang() == 'fil' ? trStr(s) : s;
+
+function trText(n) {
+  const p = n.parentNode;
+  if (!p || /^(SCRIPT|STYLE|TEXTAREA)$/.test(p.nodeName)) return;
+  const o = n.nodeValue, v = trStr(o);
+  if (v == o) return;
+  if (p.nodeName == 'OPTION' && !p.hasAttribute('value')) p.setAttribute('value', norm(o));   // keep the form value in English
+  n.nodeValue = v;
+}
+
+function trAttrs(el) {
+  for (const k of ['placeholder', 'title', 'aria-label']) {
+    const o = el.getAttribute && el.getAttribute(k);
+    if (o) { const v = trStr(o); if (v != o) el.setAttribute(k, v); }
+  }
+}
+
+function trNode(root) {
+  if (lang() != 'fil' || !root) return;
+  if (root.nodeType == 3) return trText(root);
+  if (root.nodeType != 1) return;
+  trAttrs(root);
+  root.querySelectorAll('[placeholder],[title],[aria-label]').forEach(trAttrs);
+  const w = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  let n;
+  while ((n = w.nextNode())) trText(n);
+}
+
+new MutationObserver(ms => {
+  if (lang() != 'fil') return;
+  for (const m of ms) {
+    if (m.type == 'childList') m.addedNodes.forEach(trNode);
+    else if (m.type == 'characterData') trText(m.target);
+    else trAttrs(m.target);
+  }
+}).observe(document.body, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ['placeholder', 'title', 'aria-label'] });
 
 addEventListener('hashchange', render);
 

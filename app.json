@@ -1,6 +1,0 @@
-{
-  "plugins": [
-    "@rnmapbox/maps",
-    "react-native-map-link"
-  ]
-}
